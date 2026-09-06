@@ -48,9 +48,14 @@ from . import cigr_go2  # noqa: F401
    python scripts/rsl_rl/train.py --task Isaac-Velocity-Rough-Unitree-Go2-CIGR-v0 --num_envs 64 --headless --max_iterations 5
    ```
 3. Once that runs clean, launch a real training run (drop `--max_iterations`,
-   raise `--num_envs`) and watch `cat_inspired_gait` in tensorboard
-   (`tensorboard --logdir logs/rsl_rl`) -- this is where `takeoff_force_offset`
-   / `takeoff_height_threshold` in `cigr_rough_env_cfg.py` will likely need
-   tuning (see the ADJUST comments there and in `mdp/rewards.py` -- these two
-   constants weren't recoverable from the paper's extracted PDF text).
+   raise `--num_envs`) and watch the five `cigr_takeoff_push` /
+   `cigr_takeoff_height` / `cigr_takeoff_speed` / `cigr_flight_clearance` /
+   `cigr_landing_symmetry` curves in tensorboard (`tensorboard --logdir
+   logs/rsl_rl`) -- logged as separate RewTerms (see `cigr_rough_env_cfg.py`)
+   specifically so you can see whether one component (e.g. `cigr_takeoff_speed`,
+   weight 1.68) is dominating the other four instead of only their pre-summed
+   total. This is also where `takeoff_force_offset` / `takeoff_height_threshold`
+   in `cigr_rough_env_cfg.py` will likely need tuning (see the ADJUST comments
+   there and in `mdp/rewards.py` -- these two constants weren't recoverable
+   from the paper's extracted PDF text).
 4. `python scripts/rsl_rl/play.py --task Isaac-Velocity-Rough-Unitree-Go2-CIGR-Play-v0` to watch the trained gait.

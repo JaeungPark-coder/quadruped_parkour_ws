@@ -26,6 +26,36 @@ foot_pos/foot_height/foot_force_z/jump_intent get recomputed per term
 instead of shared once -- a small duplicated-compute cost against 4 feet's
 worth of tensors, traded for that diagnostic visibility.
 
+The actual reward formulas live in cigr_math.py, not here -- see that
+file's own docstring for why (importing isaaclab.assets pulls in `omni`,
+which does not exist outside a running Isaac Sim process, so nothing in
+this file can be unit-tested without Isaac Sim actually running; the
+formulas themselves need only torch and are tested against synthetic
+tensors in test_cigr_math.py). This file is the isaaclab-dependent glue:
+resolving FL/FR/RL/RR to fixed body indices via ContactSensor.find_bodies,
+and reading the real per-step simulation tensors those formulas consume.
+
+CONFIRMED 2026-09-19, two bugs found reading this file (not yet exercised
+against a live run) and fixed in cigr_math.py:
+
+1. Foot height was plain world Z (`foot_pos_w[:, :, 2]`), meaningless once
+   this task inherits rough terrain (Isaac-Velocity-Rough-Unitree-Go2) --
+   each env's terrain patch sits at a different origin height, so standing
+   normally on a tall sub-terrain read as permanently elevated feet. This
+   was silently saturating r_flight at its upper clip (constant 1.0, zero
+   gradient) and firing r2_takeoff/jump_intent on ordinary standing.
+   `cigr_math.compute_foot_state` now subtracts each env's terrain-patch
+   origin height -- corrects the per-env constant offset, not relief
+   within one env's own patch (a step or ramp under one specific foot),
+   which needs a per-foot RayCaster not added here.
+2. r_land compared front/rear foot CENTROIDS' full 3D positions, dominated
+   by the ~0.38m front-rear hip spacing on Go2 regardless of gait --
+   `exp(-10 * 0.38) ~= 0.022`, effectively a constant with no usable
+   gradient (and what little gradient existed pointed at "pull the feet
+   together", unrelated to landing symmetry). `cigr_math.landing_symmetry`
+   now compares front/rear HEIGHT only, which the fixed body length can't
+   dominate.
+
 ADJUST: the paper's F_c (Eq. 2, a force offset inside the softplus) and z_c
 (Eq. 3, a rear-foot-height threshold) are named in the paper's text but their
 numeric values were not present in the extracted PDF content (most likely
@@ -53,72 +83,25 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 
 from isaaclab.assets import Articulation
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
+from .cigr_math import (
+    FOOT_NAMES,
+    compute_foot_state,
+    flight_clearance,
+    jump_intent,
+    landing_symmetry,
+    takeoff_height,
+    takeoff_push,
+    takeoff_speed,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
     from isaaclab.managers import RewardTermCfg
-
-# Fixed foot ordering used throughout this file: [FL, FR, RL, RR].
-_FOOT_NAMES = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
-_REAR_IDX = slice(2, 4)   # RL, RR
-_FRONT_IDX = slice(0, 2)  # FL, FR
-
-
-def _jump_intent(foot_height, foot_planar_speed, height_threshold, speed_threshold) -> torch.Tensor:
-    """I_jump: 1 if >= 2 feet simultaneously clear height_threshold AND
-    exceed speed_threshold, else 0."""
-    meets_both = (foot_height > height_threshold) & (foot_planar_speed > speed_threshold)
-    return (meets_both.sum(dim=1) >= 2).float()
-
-
-def _takeoff_push(foot_force_z, contact_threshold, force_offset, force_scale) -> torch.Tensor:
-    """r1_takeoff (Eq. 2): rear feet pushing hard against the ground while
-    both are in contact."""
-    rear_force = foot_force_z[:, _REAR_IDX]
-    f_mean = rear_force.mean(dim=1)
-    both_in_contact = (rear_force >= contact_threshold).all(dim=1).float()
-    return F.softplus((f_mean - force_offset) / force_scale) * both_in_contact
-
-
-def _takeoff_height(foot_height, height_threshold, jump_intent) -> torch.Tensor:
-    """r2_takeoff (Eq. 3): rear feet lifting above height_threshold, gated
-    by jump intent. The "20" scale factor is given explicitly in the
-    paper's Eq. (3)."""
-    z_hind = foot_height[:, _REAR_IDX].mean(dim=1)
-    return F.softplus(20.0 * (z_hind - height_threshold)) * jump_intent
-
-
-def _takeoff_speed(asset: Articulation, max_horizontal_speed, jump_intent) -> torch.Tensor:
-    """r3_takeoff (Eq. 4): reward sustaining horizontal speed during a
-    jump, capped at 1."""
-    v_xy = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=-1)
-    return torch.clamp(v_xy / max_horizontal_speed, max=1.0) * jump_intent
-
-
-def _flight_clearance(foot_height, height_min, height_max) -> torch.Tensor:
-    """r_flight (Eq. 5): all four feet's height clipped to
-    [height_min, height_max] and normalized -- keeps swing trajectories in
-    a sane band (not clipping obstacles, not wasting energy going too
-    high)."""
-    clipped = torch.clamp(foot_height, min=height_min, max=height_max)
-    return ((clipped - height_min) / (height_max - height_min)).mean(dim=1)
-
-
-def _landing_symmetry(foot_pos, foot_force_z, contact_threshold) -> torch.Tensor:
-    """r_land (Eq. 6): reward a small offset between the front-feet and
-    rear-feet centroids at touchdown (cat-like symmetric landing), gated
-    by both front feet being in contact."""
-    front_centroid = foot_pos[:, _FRONT_IDX, :].mean(dim=1)
-    rear_centroid = foot_pos[:, _REAR_IDX, :].mean(dim=1)
-    d_foot = torch.norm(front_centroid - rear_centroid, dim=-1)
-    front_force = foot_force_z[:, _FRONT_IDX]
-    both_front_in_contact = (front_force >= contact_threshold).all(dim=1).float()
-    return torch.exp(-10.0 * d_foot) * both_front_in_contact
 
 
 class _FootIndexedRewardTerm(ManagerTermBase):
@@ -132,19 +115,19 @@ class _FootIndexedRewardTerm(ManagerTermBase):
         super().__init__(cfg, env)
         self.asset: Articulation = env.scene[cfg.params["asset_cfg"].name]
         self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
-        self.foot_body_ids = [self.contact_sensor.find_bodies([name])[0][0] for name in _FOOT_NAMES]
+        self.foot_body_ids = [self.contact_sensor.find_bodies([name])[0][0] for name in FOOT_NAMES]
 
     def _foot_state(self):
-        """(N, 4, ...) tensors, foot order [FL, FR, RL, RR] per self.foot_body_ids."""
+        """(N, 4, ...) tensors, foot order [FL, FR, RL, RR] per self.foot_body_ids.
+
+        See cigr_math.compute_foot_state's own docstring for why
+        env_origins is subtracted from raw world-frame foot height."""
         foot_pos = self.asset.data.body_pos_w[:, self.foot_body_ids, :]
-        foot_height = foot_pos[:, :, 2]
-        foot_planar_speed = torch.norm(self.asset.data.body_lin_vel_w[:, self.foot_body_ids, :2], dim=-1)
-        # max over the contact sensor's history window -- robust to a single
-        # missed substep, same pattern isaaclab_tasks' foot_slip_penalty uses.
-        foot_force_z = torch.clamp(
-            torch.max(self.contact_sensor.data.net_forces_w_history[:, :, self.foot_body_ids, 2], dim=1)[0],
-            min=0.0,
-        )
+        foot_lin_vel = self.asset.data.body_lin_vel_w[:, self.foot_body_ids, :]
+        foot_force_history_z = self.contact_sensor.data.net_forces_w_history[:, :, self.foot_body_ids, 2]
+        env_origin_z = self._env.scene.env_origins[:, 2]
+        foot_height, foot_planar_speed, foot_force_z = compute_foot_state(
+            foot_pos, foot_lin_vel, foot_force_history_z, env_origin_z)
         return foot_pos, foot_height, foot_planar_speed, foot_force_z
 
 
@@ -155,7 +138,7 @@ class TakeoffPushReward(_FootIndexedRewardTerm):
                  contact_force_threshold: float = 20.0, takeoff_force_offset: float = 5.0,
                  takeoff_force_scale: float = 5.0) -> torch.Tensor:
         _, _, _, foot_force_z = self._foot_state()
-        return _takeoff_push(foot_force_z, contact_force_threshold, takeoff_force_offset, takeoff_force_scale)
+        return takeoff_push(foot_force_z, contact_force_threshold, takeoff_force_offset, takeoff_force_scale)
 
 
 class TakeoffHeightReward(_FootIndexedRewardTerm):
@@ -165,8 +148,8 @@ class TakeoffHeightReward(_FootIndexedRewardTerm):
                  takeoff_height_threshold: float = 0.05, jump_height_threshold: float = 0.1,
                  jump_speed_threshold: float = 0.2) -> torch.Tensor:
         _, foot_height, foot_planar_speed, _ = self._foot_state()
-        jump_intent = _jump_intent(foot_height, foot_planar_speed, jump_height_threshold, jump_speed_threshold)
-        return _takeoff_height(foot_height, takeoff_height_threshold, jump_intent)
+        intent = jump_intent(foot_height, foot_planar_speed, jump_height_threshold, jump_speed_threshold)
+        return takeoff_height(foot_height, takeoff_height_threshold, intent)
 
 
 class TakeoffSpeedReward(_FootIndexedRewardTerm):
@@ -176,8 +159,9 @@ class TakeoffSpeedReward(_FootIndexedRewardTerm):
                  max_horizontal_speed: float = 0.8, jump_height_threshold: float = 0.1,
                  jump_speed_threshold: float = 0.2) -> torch.Tensor:
         _, foot_height, foot_planar_speed, _ = self._foot_state()
-        jump_intent = _jump_intent(foot_height, foot_planar_speed, jump_height_threshold, jump_speed_threshold)
-        return _takeoff_speed(self.asset, max_horizontal_speed, jump_intent)
+        intent = jump_intent(foot_height, foot_planar_speed, jump_height_threshold, jump_speed_threshold)
+        v_xy = torch.norm(self.asset.data.root_lin_vel_b[:, :2], dim=-1)
+        return takeoff_speed(v_xy, max_horizontal_speed, intent)
 
 
 class FlightClearanceReward(_FootIndexedRewardTerm):
@@ -186,7 +170,7 @@ class FlightClearanceReward(_FootIndexedRewardTerm):
     def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg,
                  flight_height_min: float = 0.03, flight_height_max: float = 0.12) -> torch.Tensor:
         _, foot_height, _, _ = self._foot_state()
-        return _flight_clearance(foot_height, flight_height_min, flight_height_max)
+        return flight_clearance(foot_height, flight_height_min, flight_height_max)
 
 
 class LandingSymmetryReward(_FootIndexedRewardTerm):
@@ -194,5 +178,5 @@ class LandingSymmetryReward(_FootIndexedRewardTerm):
 
     def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, sensor_cfg: SceneEntityCfg,
                  contact_force_threshold: float = 20.0) -> torch.Tensor:
-        foot_pos, _, _, foot_force_z = self._foot_state()
-        return _landing_symmetry(foot_pos, foot_force_z, contact_force_threshold)
+        _, foot_height, _, foot_force_z = self._foot_state()
+        return landing_symmetry(foot_height, foot_force_z, contact_force_threshold)

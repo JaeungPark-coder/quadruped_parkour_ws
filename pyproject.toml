@@ -140,3 +140,17 @@ ignore-words-list = "haa,slq,collapsable,buss,reacher,thirdparty"
 markers = [
     "isaacsim_ci: mark test to run in isaacsim ci",
 ]
+# Without this, plain `pytest` in a shell with ROS 2 Humble sourced fails
+# before collecting anything: pytest's plugin autoloading picks up
+# launch_testing/launch_ros/ament_lint's pytest11 entrypoints from
+# /opt/ros/humble, and launch_testing's own import chain reaches
+# `from lark import Lark`, which is not installed in this project's Python
+# environment -- ModuleNotFoundError, at plugin-load time, before any test
+# runs. Same fix as vla_ur5e_ws/pytest.ini and potato_drill_ws/setup.cfg
+# (same root cause: colliding with the ROS-sourced shell this workspace
+# also needs). Confirmed 2026-09-19 against tests/test_cigr_math.py.
+addopts = """
+    -p no:launch_testing -p no:launch_ros -p no:launch_pytest
+    -p no:ament_lint -p no:ament_flake8 -p no:ament_pep257
+    -p no:ament_copyright -p no:ament_xmllint
+"""
